@@ -3,7 +3,7 @@
 #include <iostream>
 #include <cmath>
 #include <vector>
-#include <stdexcept>
+#include <algorithm>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -12,167 +12,153 @@
 namespace deadbeat {
 
 AudioEngine::AudioEngine()
-: initialized_(false),
-  sampleRate_(44100.0)
-{
-    // outParams_ will be filled in initialize()
-}
+: initialized_(false), sampleRate_(44100.0) {}
 
-AudioEngine::~AudioEngine() {
-    if (initialized_) shutdown();
-}
+AudioEngine::~AudioEngine() { if (initialized_) shutdown(); }
 
 void AudioEngine::initialize() {
     PaError err = Pa_Initialize();
-    if (err != paNoError) {
+    if (err != paNoError)
         throw std::runtime_error(std::string("Pa_Initialize failed: ") + Pa_GetErrorText(err));
-    }
     initialized_ = true;
-    utils::log("AudioEngine initialized (PortAudio)");
+    utils::log("AudioEngine initialized");
 }
 
 void AudioEngine::shutdown() {
-    PaError err = Pa_Terminate();
-    if (err != paNoError) {
-        utils::log(std::string("Pa_Terminate error: ") + Pa_GetErrorText(err));
-    } else {
-        utils::log("AudioEngine shutdown (PortAudio)");
-    }
+    Pa_Terminate();
     initialized_ = false;
+    utils::log("AudioEngine shutdown");
 }
 
+// ---------- Low-level single note ----------
 void AudioEngine::playTone(double frequency, double duration, double amplitude, WaveformType waveform) {
-    if (!initialized_) {
-        utils::log("AudioEngine not initialized. Call initialize() first.");
-        return;
-    }
-    if (duration <= 0.0) {
-        utils::log("playTone called with non-positive duration.");
-        return;
-    }
-
-    std::string waveName;
-    switch (waveform) {
-        case WaveformType::Sine: waveName = "Sine"; break;
-        case WaveformType::Square: waveName = "Square"; break;
-        case WaveformType::Saw: waveName = "Saw"; break;
-        default: waveName = "Unknown"; break;
-    }
-
-    utils::log("playTone: freq=" + std::to_string(frequency) +
-               "Hz dur=" + std::to_string(duration) + "s amp=" + std::to_string(amplitude) +
-               " wave=" + waveName);
+    if (!initialized_) return;
 
     PaStream* stream = nullptr;
-    PaError err;
-
-    // Setup output parameters (default output device)
     PaDeviceIndex dev = Pa_GetDefaultOutputDevice();
-    if (dev == paNoDevice) {
-        utils::log("No default output device.");
-        return;
-    }
+    if (dev == paNoDevice) return;
 
     outParams_.device = dev;
-    outParams_.channelCount = 1; // mono for simplicity
+    outParams_.channelCount = 1;
     outParams_.sampleFormat = paFloat32;
     outParams_.suggestedLatency = Pa_GetDeviceInfo(dev)->defaultLowOutputLatency;
     outParams_.hostApiSpecificStreamInfo = nullptr;
 
-    unsigned long framesPerBuffer = 256; // small buffer for low-latency
-    double sampleRate = sampleRate_;
+    Pa_OpenStream(&stream, nullptr, &outParams_, sampleRate_, paFramesPerBufferUnspecified, paClipOff, nullptr, nullptr);
+    Pa_StartStream(stream);
 
-    err = Pa_OpenStream(
-        &stream,
-        nullptr,               // no input
-        &outParams_,
-        sampleRate,
-        framesPerBuffer,
-        paClipOff,
-        nullptr,               // no callback -> blocking API
-        nullptr
-    );
-    if (err != paNoError) {
-        utils::log(std::string("Pa_OpenStream failed: ") + Pa_GetErrorText(err));
-        return;
-    }
+    const unsigned long totalFrames = static_cast<unsigned long>(duration * sampleRate_);
+    std::vector<float> buffer(totalFrames);
 
-    err = Pa_StartStream(stream);
-    if (err != paNoError) {
-        utils::log(std::string("Pa_StartStream failed: ") + Pa_GetErrorText(err));
-        Pa_CloseStream(stream);
-        return;
-    }
-
-    // Generate and write samples in chunks
-    const unsigned long totalFrames = static_cast<unsigned long>(duration * sampleRate);
-    std::vector<float> buffer(framesPerBuffer);
     double phase = 0.0;
-    double phaseIncrement = 2.0 * M_PI * frequency / sampleRate;
-
-    unsigned long framesWritten = 0;
-    while (framesWritten < totalFrames) {
-        unsigned long framesThisBuffer = std::min<unsigned long>(framesPerBuffer, totalFrames - framesWritten);
-        for (unsigned long i = 0; i < framesThisBuffer; ++i) {
-            double t = (static_cast<double>(framesWritten + i)) / sampleRate;
-            double sample = 0.0;
-            switch (waveform) {
-                case WaveformType::Sine:
-                    sample = std::sin(phase);
-                    break;
-                case WaveformType::Square:
-                    sample = (std::sin(phase) >= 0.0) ? 1.0 : -1.0;
-                    break;
-                case WaveformType::Saw: {
-                    // naive saw using phase normalized to [-1,1]
-                    double normalized = (phase / (2.0 * M_PI));
-                    // keep normalized in [-0.5, 0.5)
-                    normalized = normalized - std::floor(normalized + 0.5);
-                    sample = 2.0 * normalized;
-                    break;
-                }
-                default:
-                    sample = std::sin(phase);
-            }
-            buffer[i] = static_cast<float>(sample * amplitude);
-            phase += phaseIncrement;
-            if (phase >= 2.0 * M_PI) phase -= 2.0 * M_PI;
+    double inc = 2.0 * M_PI * frequency / sampleRate_;
+    for (unsigned long i = 0; i < totalFrames; ++i) {
+        double sample = 0.0;
+        switch (waveform) {
+            case WaveformType::Sine: sample = std::sin(phase); break;
+            case WaveformType::Square: sample = (std::sin(phase) >= 0) ? 1.0 : -1.0; break;
+            case WaveformType::Saw: sample = 2.0 * (phase/(2*M_PI) - std::floor(phase/(2*M_PI)+0.5)); break;
+            case WaveformType::Triangle: sample = 2.0 * std::abs(2.0*(phase/(2*M_PI)-std::floor(phase/(2*M_PI)+0.5))) -1.0; break;
         }
-
-        // Write to stream (blocking)
-        err = Pa_WriteStream(stream, buffer.data(), framesThisBuffer);
-        if (err != paNoError) {
-            utils::log(std::string("Pa_WriteStream error: ") + Pa_GetErrorText(err));
-            break;
-        }
-        framesWritten += framesThisBuffer;
+        buffer[i] = static_cast<float>(sample * amplitude);
+        phase += inc;
+        if (phase >= 2.0*M_PI) phase -= 2.0*M_PI;
     }
 
-    // Drain and close
-    err = Pa_StopStream(stream);
-    if (err != paNoError) {
-        utils::log(std::string("Pa_StopStream error: ") + Pa_GetErrorText(err));
-    }
+    Pa_WriteStream(stream, buffer.data(), totalFrames);
+    Pa_StopStream(stream);
     Pa_CloseStream(stream);
-    utils::log("playTone finished");
 }
 
-void AudioEngine::loadSample(const std::string& path) {
-    utils::log("Loading sample (stub): " + path);
-    // TODO: implement libsndfile-based loading
+// ---------- Stub samples ----------
+void AudioEngine::loadSample(const std::string& path) { utils::log("loadSample stub: "+path); }
+void AudioEngine::playSample(const std::string& name) { utils::log("playSample stub: "+name); }
+
+// ---------- Mix / render AST ----------
+void AudioEngine::mix(std::shared_ptr<Node> node, int bpm) {
+    if (!initialized_ || !node) return;
+
+    double beatDuration = 60.0 / bpm; // seconds per beat
+    std::vector<float> buffer;
+    renderNode(node, beatDuration, buffer);
+
+    // Play buffer via PortAudio
+    PaStream* stream = nullptr;
+    PaDeviceIndex dev = Pa_GetDefaultOutputDevice();
+    if (dev == paNoDevice) return;
+
+    outParams_.device = dev;
+    outParams_.channelCount = 1;
+    outParams_.sampleFormat = paFloat32;
+    outParams_.suggestedLatency = Pa_GetDeviceInfo(dev)->defaultLowOutputLatency;
+    outParams_.hostApiSpecificStreamInfo = nullptr;
+
+    Pa_OpenStream(&stream, nullptr, &outParams_, sampleRate_, paFramesPerBufferUnspecified, paClipOff, nullptr, nullptr);
+    Pa_StartStream(stream);
+    Pa_WriteStream(stream, buffer.data(), buffer.size());
+    Pa_StopStream(stream);
+    Pa_CloseStream(stream);
+    utils::log("Mix finished");
 }
 
-void AudioEngine::playSample(const std::string& name) {
-    utils::log("Playing sample (stub): " + name);
-    // TODO: implement sample playback via PortAudio
+// ---------- Recursive render helpers ----------
+void AudioEngine::renderNode(std::shared_ptr<Node> node, double beatDuration, std::vector<float>& buffer) {
+    if (!node) return;
+
+    if (auto n = std::dynamic_pointer_cast<Note>(node)) {
+        unsigned long frames = static_cast<unsigned long>(n->duration * beatDuration * sampleRate_);
+        double phase=0, inc=2*M_PI*n->freq/sampleRate_;
+        std::vector<float> noteBuf(frames);
+        for (unsigned long i=0;i<frames;++i){
+            double sample=0;
+            switch(n->waveform){
+                case WaveformType::Sine: sample=std::sin(phase); break;
+                case WaveformType::Square: sample=(std::sin(phase)>=0)?1:-1; break;
+                case WaveformType::Saw: sample=2.0*(phase/(2*M_PI)-std::floor(phase/(2*M_PI)+0.5)); break;
+                case WaveformType::Triangle: sample=2.0*std::abs(2.0*(phase/(2*M_PI)-std::floor(phase/(2*M_PI)+0.5)))-1.0; break;
+            }
+            noteBuf[i]=static_cast<float>(sample*n->amplitude);
+            phase+=inc; if(phase>=2*M_PI) phase-=2*M_PI;
+        }
+        buffer.insert(buffer.end(), noteBuf.begin(), noteBuf.end());
+    } else if (auto s = std::dynamic_pointer_cast<Sequence>(node)) {
+        renderSequence(s, beatDuration, buffer);
+    } else if (auto p = std::dynamic_pointer_cast<Parallel>(node)) {
+        renderParallel(p, beatDuration, buffer);
+    } else if (auto id = std::dynamic_pointer_cast<Identifier>(node)) {
+        utils::log("Identifier render stub: "+id->name);
+    }
 }
 
-void AudioEngine::mix() {
-    utils::log("Mix (stub)");
+void AudioEngine::renderSequence(std::shared_ptr<Sequence> seq, double beatDuration, std::vector<float>& buffer){
+    for(auto& child : seq->children){
+        std::vector<float> tmp;
+        renderNode(child, beatDuration, tmp);
+        buffer.insert(buffer.end(), tmp.begin(), tmp.end());
+    }
 }
 
-void AudioEngine::stopAll() {
-    utils::log("StopAll (stub)");
+void AudioEngine::renderParallel(std::shared_ptr<Parallel> par, double beatDuration, std::vector<float>& buffer){
+    std::vector<std::vector<float>> childBuffers;
+    size_t maxSize = 0;
+
+    // Render all children separately
+    for(auto& child : par->children){
+        std::vector<float> tmp;
+        renderNode(child, beatDuration, tmp);
+        maxSize = std::max(maxSize, tmp.size());
+        childBuffers.push_back(std::move(tmp));
+    }
+
+    // Resize buffer to maxSize
+    buffer.resize(maxSize, 0.0f);
+
+    // Sum each child buffer into buffer, pad shorter ones with zeros
+    for(auto& cb : childBuffers){
+        for(size_t i = 0; i < cb.size(); ++i) buffer[i] += cb[i];
+    }
 }
+
+void AudioEngine::stopAll(){ utils::log("stopAll stub"); }
 
 } // namespace deadbeat
