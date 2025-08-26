@@ -20,6 +20,7 @@
           clang-tools
           gdb
           cmake
+          pkg-config
         ];
       in {
         devShells.default = pkgs.mkShell {
